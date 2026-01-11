@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GamePhase, Player, GameScenario } from './types';
-import { generateGameScenario } from './services/geminiService';
+import { generateGameScenario, prefetchScenario } from './services/geminiService';
 import { playSound, toggleBackgroundMusic, tryResumeAudioContext, startFireAmbience, stopFireAmbience } from './services/audioService';
 import { getRandomAvatar, getFallbackAvatar, fetchRealCharacters } from './services/avatarService';
 import { Button } from './components/Button';
@@ -63,6 +63,7 @@ const App: React.FC = () => {
   
   // Voting & Suspense State
   const [eliminatedPlayer, setEliminatedPlayer] = useState<Player | null>(null);
+  const [selectedSuspect, setSelectedSuspect] = useState<Player | null>(null); // New state for vote confirmation
   const [isSuspensePhase, setIsSuspensePhase] = useState(false);
 
   // Music State
@@ -71,7 +72,9 @@ const App: React.FC = () => {
   // Reveal Drag State
   const [dragOffset, setDragOffset] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
+  const [isRevealed, setIsRevealed] = useState(false);
   const startYRef = useRef(0);
+  const cardRef = useRef<HTMLDivElement>(null);
   const currentDragRef = useRef(0);
 
   // Roulette State
@@ -85,7 +88,6 @@ const App: React.FC = () => {
   // Refs
   const timerRef = useRef<number | null>(null);
   const playersEndRef = useRef<HTMLDivElement>(null);
-  const cardHeight = 420; // Approximate height of the card in px for calculation
   const isLoadedFromCache = useRef(false);
 
   // --- Handlers ---
@@ -188,6 +190,11 @@ const App: React.FC = () => {
   const handleStartSetup = () => {
     playSound('click');
     toggleBackgroundMusic(false); // Fade out music
+    
+    // START PREFETCHING SCENARIO HERE
+    // While user configures players, AI generates content in background
+    prefetchScenario();
+    
     setPhase(GamePhase.SETUP);
   };
 
@@ -269,53 +276,126 @@ const App: React.FC = () => {
     const newScenario = await generateGameScenario();
     setScenario(newScenario);
 
-    const shuffledPlayers = [...filledPlayers];
-    shuffledPlayers.forEach(p => { p.isImposter = false; p.isDead = false; });
-    
-    const imposterIndices = new Set<number>();
-    while(imposterIndices.size < imposterCount) {
-      const idx = Math.floor(Math.random() * shuffledPlayers.length);
-      imposterIndices.add(idx);
+    // --- ALGORITMO FISHER-YATES PARA ASIGNACIÓN DE ROLES ---
+    // 1. Crear el mazo de roles (True = Impostor, False = Civil)
+    const roleDeck = Array(filledPlayers.length).fill(false);
+    for (let i = 0; i < imposterCount; i++) {
+        roleDeck[i] = true;
     }
-    
-    imposterIndices.forEach(idx => {
-      shuffledPlayers[idx].isImposter = true;
-    });
 
-    setPlayers(shuffledPlayers);
+    // 2. Barajar el mazo de roles de forma totalmente aleatoria
+    for (let i = roleDeck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [roleDeck[i], roleDeck[j]] = [roleDeck[j], roleDeck[i]];
+    }
+
+    // 3. Asignar los roles barajados a los jugadores
+    // Mantenemos el orden de 'filledPlayers' para que la ronda de "pasar el móvil"
+    // siga el orden visual de la lista, pero el rol es impredecible.
+    const playersWithRoles = filledPlayers.map((p, i) => ({
+        ...p,
+        isImposter: roleDeck[i],
+        isDead: false
+    }));
+
+    setPlayers(playersWithRoles);
     setCurrentPlayerIndex(0);
     setPhase(GamePhase.DISTRIBUTE);
   };
 
   // --- REVEAL MECHANIC: DRAG TO REVEAL ---
   const handlePointerDown = (e: React.PointerEvent) => {
+    // Prevent scrolling or other touch actions to ensure clean drag
+    e.preventDefault(); 
+    
     setIsDragging(true);
     startYRef.current = e.clientY;
-    currentDragRef.current = 0; // Reset current drag tracking
+    currentDragRef.current = dragOffset; // Capture current state
+    
+    // Pointer capture ensures we keep receiving events even if pointer leaves element bounds
     e.currentTarget.setPointerCapture(e.pointerId);
-    playSound('click');
   };
 
   const handlePointerMove = (e: React.PointerEvent) => {
     if (!isDragging) return;
     
+    const containerHeight = cardRef.current?.clientHeight || 420;
     const deltaY = startYRef.current - e.clientY;
-    const newOffset = Math.max(0, Math.min(deltaY, cardHeight));
     
-    setDragOffset(newOffset);
-    currentDragRef.current = newOffset;
+    // Logic: 
+    // If NOT revealed: Dragging UP (positive deltaY) increases offset towards Open (height).
+    // If REVEALED: Dragging DOWN (negative deltaY) decreases offset from Open (height).
+    
+    let newOffset = 0;
+    
+    if (isRevealed) {
+        // Starting from Open (offset = height)
+        // deltaY is negative when dragging down
+        newOffset = containerHeight + deltaY;
+    } else {
+        // Starting from Closed (offset = 0)
+        // deltaY is positive when dragging up
+        newOffset = deltaY;
+    }
+
+    // Clamp values
+    const clamped = Math.max(0, Math.min(newOffset, containerHeight));
+    setDragOffset(clamped);
   };
 
   const handlePointerUp = (e: React.PointerEvent) => {
+    if (!isDragging) return;
     setIsDragging(false);
-    setDragOffset(0); 
-    playSound('click');
+
+    const containerHeight = cardRef.current?.clientHeight || 420;
+    
+    // Calculate how much we moved from the starting state
+    // If started closed: moved = dragOffset
+    // If started open: moved = height - dragOffset
+    const movedAmount = isRevealed ? (containerHeight - dragOffset) : dragOffset;
+
+    // Detection for "Click/Tap" vs "Drag"
+    // If movement is very small (< 10px), treat as tap
+    const isTap = movedAmount < 10 && Math.abs(startYRef.current - e.clientY) < 10;
+    const threshold = containerHeight * 0.25; // 25% drag to trigger snap
+
+    if (isTap) {
+        // Toggle on tap
+        const newState = !isRevealed;
+        setIsRevealed(newState);
+        setDragOffset(newState ? containerHeight : 0);
+        // Play sound only on CLOSE, remove sound on OPEN
+        if (!newState) playSound('click');
+        // if (newState) playSound('reveal'); // REMOVED PER REQUEST
+    } else {
+        // Drag Snap Logic
+        if (!isRevealed) {
+            // Opening
+            if (movedAmount > threshold) {
+                setIsRevealed(true);
+                setDragOffset(containerHeight);
+                // playSound('reveal'); // REMOVED PER REQUEST
+            } else {
+                setDragOffset(0); // Snap back closed
+            }
+        } else {
+            // Closing
+            if (movedAmount > threshold) {
+                setIsRevealed(false);
+                setDragOffset(0);
+                playSound('click');
+            } else {
+                setDragOffset(containerHeight); // Snap back open
+            }
+        }
+    }
   };
 
   const handleNextPlayer = () => {
     playSound('click');
     setDragOffset(0);
     setIsDragging(false);
+    setIsRevealed(false); // Reset reveal state for next player
     if (currentPlayerIndex < players.length - 1) {
       setCurrentPlayerIndex(prev => prev + 1);
     } else {
@@ -333,8 +413,8 @@ const App: React.FC = () => {
     
     // Physics Constants
     let angle = 0;
-    let velocity = Math.random() * 30 + 50; // Increased velocity for faster spin (was 20+30)
-    const friction = 0.985;
+    let velocity = Math.random() * 50 + 80; // Velocidad significativamente aumentada (era 30+50)
+    const friction = 0.98; // Fricción ajustada para balancear la duración (era 0.985)
     
     const segmentAngle = 360 / players.length;
     let lastSegment = -1;
@@ -396,6 +476,10 @@ const App: React.FC = () => {
       startFireAmbience();
     }
     
+    // PREFETCH NEXT GAME SCENARIO
+    // Optimization: Generate next word while playing current round so re-play is instant
+    prefetchScenario();
+
     setPhase(GamePhase.PLAYING);
     setTimerActive(true);
   };
@@ -411,6 +495,7 @@ const App: React.FC = () => {
     setIsSuspensePhase(false);
     setRouletteWinner(null);
     setIsSpinning(false);
+    setSelectedSuspect(null);
     stopFireAmbience();
     // Restart music if enabled
     if (isMusicEnabled) {
@@ -423,6 +508,7 @@ const App: React.FC = () => {
   const handleStartVoting = () => {
     playSound('alert');
     setTimerActive(false);
+    setSelectedSuspect(null); // Reset selection
     setPhase(GamePhase.VOTING);
   };
 
@@ -752,6 +838,7 @@ const App: React.FC = () => {
 
         {/* CARD CONTAINER */}
         <div 
+          ref={cardRef}
           className="relative w-full max-w-sm aspect-[3/4.5] rounded-[2.5rem] overflow-hidden shadow-2xl border border-white/10 bg-black"
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
@@ -796,7 +883,7 @@ const App: React.FC = () => {
            {/* --- LAYER 2: COVER / CURTAIN (TOP) --- */}
            {/* This is what moves up */}
            <div 
-             className="absolute inset-0 w-full h-full z-20 flex flex-col items-center justify-between p-8 bg-gradient-to-br from-ai-surface via-ai-base to-black border-b-4 border-ai-accent/50 shadow-2xl"
+             className="absolute inset-0 w-full h-full z-20 flex flex-col items-center justify-between p-8 bg-gradient-to-br from-ai-surface via-ai-base to-black border-b-4 border-ai-accent/50 shadow-2xl cursor-grab active:cursor-grabbing"
              style={{ 
                  transform: `translateY(-${dragOffset}px)`,
                  transition: isDragging ? 'none' : 'transform 0.5s cubic-bezier(0.34, 1.56, 0.64, 1)',
@@ -818,7 +905,7 @@ const App: React.FC = () => {
               </div>
 
               {/* Main Content on Cover */}
-              <div className="flex flex-col items-center gap-4 flex-1 justify-center">
+              <div className="flex flex-col items-center gap-4 flex-1 justify-center pointer-events-none">
                    <div className="w-52 h-52 rounded-full border-4 border-ai-dim/20 flex items-center justify-center relative bg-black overflow-hidden shadow-[0_0_30px_rgba(217,70,239,0.2)]">
                         <img 
                           src={currentPlayer.avatar} 
@@ -842,7 +929,9 @@ const App: React.FC = () => {
                       <ChevronUp className="w-6 h-6 text-ai-accent" />
                       <ChevronUp className="w-6 h-6 text-ai-accent/50 -mt-4" />
                   </div>
-                  <p className="text-xs font-bold text-ai-accent uppercase tracking-[0.2em]">Desliza para revelar</p>
+                  <p className="text-xs font-bold text-ai-accent uppercase tracking-[0.2em]">
+                      {isRevealed ? "Toca para cerrar" : "Desliza o toca"}
+                  </p>
                   
                   {/* Visual Handle Bar */}
                   <div className="w-16 h-1.5 bg-ai-accent/30 rounded-full mt-2"></div>
@@ -1082,32 +1171,59 @@ const App: React.FC = () => {
         <p className="text-ai-dim font-medium">Selecciona al sospechoso para eliminarlo</p>
       </div>
       
-      <div className="grid grid-cols-2 gap-4 overflow-y-auto max-h-[65vh] pb-24 px-1">
-        {alivePlayers.map(p => (
-          <button
-            key={p.id}
-            onClick={() => handleVotePlayer(p)}
-            className="relative ai-card hover:bg-ai-surface border border-transparent hover:border-ai-danger/50 p-4 rounded-3xl flex flex-col items-center justify-center gap-4 transition-all group active:scale-[0.95] aspect-square shadow-lg overflow-hidden"
-          >
-            <div className="w-full h-full absolute inset-0 opacity-40 group-hover:opacity-100 transition-opacity bg-gradient-to-t from-ai-base to-transparent z-10 pointer-events-none"></div>
-            
-            <div className="w-full h-full rounded-2xl overflow-hidden border-2 border-white/5 group-hover:border-ai-danger transition-colors shadow-inner relative z-0">
-               <img 
-                  src={p.avatar} 
-                  alt={p.name} 
-                  className="w-full h-full object-cover object-top group-hover:scale-110 transition-transform duration-500" 
-                  onError={handleImageError}
-                />
-            </div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-8 overflow-y-auto max-h-[55vh] pb-8 px-1">
+        {alivePlayers.map(p => {
+          const isSelected = selectedSuspect?.id === p.id;
+          return (
+            <button
+              key={p.id}
+              onClick={() => {
+                 if (isSelected) {
+                     setSelectedSuspect(null);
+                     playSound('click');
+                 } else {
+                     setSelectedSuspect(p);
+                     playSound('click');
+                 }
+              }}
+              className={`relative ai-card p-4 rounded-3xl flex flex-col items-center justify-center gap-3 transition-all group active:scale-[0.95] aspect-square shadow-lg overflow-hidden border-2 ${isSelected ? 'border-ai-danger bg-ai-danger/10 scale-105 shadow-neon-red' : 'border-transparent hover:bg-ai-surface hover:border-ai-dim/20'}`}
+            >
+              <div className="w-full h-full absolute inset-0 opacity-40 transition-opacity bg-gradient-to-t from-ai-base to-transparent z-10 pointer-events-none"></div>
+              
+              <div className={`w-full flex-1 rounded-2xl overflow-hidden border-2 transition-colors shadow-inner relative z-0 ${isSelected ? 'border-ai-danger' : 'border-white/5'}`}>
+                <img 
+                    src={p.avatar} 
+                    alt={p.name} 
+                    className="w-full h-full object-cover object-top transition-transform duration-500" 
+                    onError={handleImageError}
+                  />
+              </div>
 
-            <span className="font-bold text-sm sm:text-base text-white group-hover:text-ai-danger transition-colors text-center leading-tight break-words w-full relative z-20 drop-shadow-md">
-              {p.name}
-            </span>
-            <div className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-all duration-300 transform scale-50 group-hover:scale-100 z-20">
-               <Skull className="w-6 h-6 text-ai-danger drop-shadow-md" fill="currentColor" />
-            </div>
-          </button>
-        ))}
+              <span className={`font-bold text-sm sm:text-base transition-colors text-center leading-tight break-words w-full relative z-20 drop-shadow-md pb-1 ${isSelected ? 'text-ai-danger' : 'text-white'}`}>
+                {p.name}
+              </span>
+              
+              {isSelected && (
+                <div className="absolute top-3 right-3 z-20 animate-pop">
+                  <Skull className="w-6 h-6 text-ai-danger drop-shadow-md" fill="currentColor" />
+                </div>
+              )}
+            </button>
+          )
+        })}
+      </div>
+
+      <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-ai-base via-ai-base/95 to-transparent z-20">
+          <Button 
+            fullWidth 
+            size="lg" 
+            variant="danger"
+            disabled={!selectedSuspect}
+            onClick={() => selectedSuspect && handleVotePlayer(selectedSuspect)}
+            className="shadow-neon-red py-5"
+          >
+             CONFIRMAR ELIMINACIÓN <Skull className="w-5 h-5 ml-2" />
+          </Button>
       </div>
     </TransitionWrapper>
   )};
